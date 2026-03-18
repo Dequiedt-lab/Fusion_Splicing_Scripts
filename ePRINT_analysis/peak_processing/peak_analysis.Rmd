@@ -1,0 +1,450 @@
+---
+title: "ePRINT peaks analysis"
+author: "`r Sys.getenv('USER')`"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Configuration
+
+All experiment-specific paths and labels live here. Adapt before knitting.
+```{r config}
+library(Biostrings)
+library(GenomicRanges)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(rtracklayer)
+library(pheatmap)
+library(universalmotif)
+library(ape)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+# Root of the peak-processing output directory
+peak_dir <- "/path/to/your/experiment/peak_processing/"
+
+# Directory for figure/table outputs (used when writing results for publication)
+fig_dir  <- "/path/to/your/figures/output/"
+
+# Path to the pre-built combined PWM RData object
+pwm_rdata <- "/path/to/your/resources/motifs/all_combined_pwms.RData"
+
+# Path to POSTAR3 CLIP ranges RData object (for cross-validation)
+clip_rdata <- "/path/to/your/resources/clip_data/postar3/all_clip_ranges.RData"
+
+# Path to splicing landscape RData objects
+splicing_background_rdata <- "/path/to/your/splicing/background_events.RData"
+splicing_landscape_rdata  <- "/path/to/your/splicing/all_landscapes.RData"
+
+# Condition labels — must match those used in peaks_r_treat.R / peak_processing.sh
+cond1 <- "condition1"   # e.g. "noDOX"
+cond2 <- "condition2"   # e.g. "DOX"
+
+# Number of bedtools-shuffled background sets generated per condition (Step 5 of
+# peak_processing.sh). Shuffled files are named <cond>_shuffled1.bed … <cond>_shuffledN.bed
+N_SHUFFLES <- 5
+
+# Extension (bp) applied to peaks when computing overlaps and extracting sequences
+PEAK_EXT <- 50
+
+# Fold-change threshold for calling condition-exclusive peaks
+# (peak is exclusive if its mean_lfc is > FC_EXCLUSIVE_THRESH * the other condition's)
+FC_EXCLUSIVE_THRESH <- 2
+
+# Replacement for Inf in -log10(p) columns
+INF_SENTINEL <- 400
+
+load(pwm_rdata)
+```
+
+---
+
+## 1  Loading reproducible merged peaks
+```{r load-peaks}
+#' Read a reprod.merged BED file and return a GRanges with score metadata
+load_reprod_merged <- function(path) {
+  raw <- read.table(path)
+  GRanges(
+    seqnames  = raw$V1,
+    ranges    = IRanges(start = raw$V2, end = raw$V3),
+    strand    = raw$V6,
+    # Columns 7 and 9 carry log2FC from each replicate; 4,5 carry peak p-values;
+    # 8 and 10 carry enrichment p-values — see peaks_r_treat.R for column layout
+    mean_lfc         = rowMeans(cbind(raw$V7, raw$V9)),
+    mean_peakPval    = rowMeans(cbind(raw$V4, raw$V5)),
+    mean_enrichPval  = rowMeans(cbind(raw$V8, raw$V10))
+  )
+}
+
+ranges_c1 <- load_reprod_merged(paste0(peak_dir, cond1, ".reprod.merged.bed"))
+ranges_c2 <- load_reprod_merged(paste0(peak_dir, cond2, ".reprod.merged.bed"))
+
+ranges_c1
+ranges_c2
+```
+
+---
+
+## 2  Peak width distributions
+```{r peak-widths}
+hist(width(ranges_c1), breaks = 30, main = paste(cond1, "peak widths"), xlab = "Width (bp)")
+hist(width(ranges_c2), breaks = 30, main = paste(cond2, "peak widths"), xlab = "Width (bp)")
+
+write.table(width(ranges_c1),
+  file = paste0(fig_dir, "width_", cond1, ".txt"),
+  quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+write.table(width(ranges_c2),
+  file = paste0(fig_dir, "width_", cond2, ".txt"),
+  quote = FALSE, row.names = FALSE, col.names = FALSE)
+```
+
+---
+
+## 3  Genomic annotations
+```{r annotations}
+annot_priority <- c("5UTR", "3UTR", "Exon", "Intron", "Promoter", "Downstream", "Intergenic")
+
+annot_c1 <- annotatePeak(ranges_c1, TxDb = txdb, genomicAnnotationPriority = annot_priority)
+plotAnnoPie(annot_c1)
+annot_c1
+
+annot_c2 <- annotatePeak(ranges_c2, TxDb = txdb, genomicAnnotationPriority = annot_priority)
+plotAnnoPie(annot_c2)
+annot_c2
+```
+
+---
+
+## 4  Cross-validation with POSTAR3 CLIP data
+```{r clip-overlap}
+load(clip_rdata)
+
+#' Fraction of peaks in `query` overlapping at least one CLIP range
+frac_clip_overlap <- function(query, clip_ranges, ext = PEAK_EXT) {
+  o  <- findOverlaps(query + ext, clip_ranges)
+  tt <- table(queryHits(o))
+  v  <- integer(length(query))
+  v[as.integer(names(tt))] <- as.integer(tt)
+  mean(v > 0)
+}
+
+frac_c1     <- frac_clip_overlap(ranges_c1, all_clip_ranges)
+frac_c2     <- frac_clip_overlap(ranges_c2, all_clip_ranges)
+
+# Random background: pooled shuffled peaks generated in peak_processing.sh
+random_peaks  <- read.delim(paste0(peak_dir, "random_peaks.bed"), header = FALSE)
+random_ranges <- GRanges(
+  seqnames = random_peaks$V1,
+  ranges   = IRanges(start = random_peaks$V2, end = random_peaks$V3),
+  strand   = random_peaks$V6
+)
+frac_random <- frac_clip_overlap(random_ranges, all_clip_ranges)
+
+message(cond1,  " peaks overlapping CLIP: ", round(frac_c1     * 100, 1), "%")
+message(cond2,  " peaks overlapping CLIP: ", round(frac_c2     * 100, 1), "%")
+message("Random peaks overlapping CLIP:  ", round(frac_random  * 100, 1), "%")
+
+# Permutation test: how often does a same-size random sample match or exceed
+# the observed overlap fraction?
+perm_test <- function(background_v, observed_frac, n_peaks, n_rep = 10000) {
+  rep_fracs <- replicate(n_rep, mean(sample(background_v, size = n_peaks) > 0))
+  mean(rep_fracs >= observed_frac)
+}
+
+v_random <- {
+  o  <- findOverlaps(random_ranges + PEAK_EXT, all_clip_ranges)
+  tt <- table(queryHits(o))
+  v  <- integer(length(random_ranges))
+  v[as.integer(names(tt))] <- as.integer(tt)
+  v
+}
+
+message(cond1, " permutation p-value: ",
+  perm_test(v_random, frac_c1, length(ranges_c1)))
+message(cond2, " permutation p-value: ",
+  perm_test(v_random, frac_c2, length(ranges_c2)))
+```
+
+---
+
+## 5  Sequence extraction
+```{r extract-sequences}
+#' Extract peak sequences (strict and extended), write FASTA, return DNAStringSet
+extract_and_write_seqs <- function(gr, label, ext = PEAK_EXT, out_dir = peak_dir) {
+
+  seqs_strict <- getSeq(BSgenome.Hsapiens.UCSC.hg38, gr)
+  names(seqs_strict) <- paste0("peak_", seq_along(seqs_strict))
+  writeXStringSet(seqs_strict, filepath = paste0(out_dir, label, "_seqs.fasta"))
+
+  seqs_ext <- getSeq(BSgenome.Hsapiens.UCSC.hg38, gr + ext)
+  names(seqs_ext) <- paste0("peak_", seq_along(seqs_ext))
+  writeXStringSet(seqs_ext,    filepath = paste0(out_dir, label, "_seqs_ext", ext, ".fasta"))
+
+  invisible(list(strict = seqs_strict, extended = seqs_ext))
+}
+
+extract_and_write_seqs(ranges_c1, cond1)
+extract_and_write_seqs(ranges_c2, cond2)
+
+# Shuffled background sequences (one FASTA per shuffle set, named <cond>_shuffled<i>)
+for (cond in c(cond1, cond2)) {
+  for (i in seq_len(N_SHUFFLES)) {
+    shuf_raw <- read.table(paste0(peak_dir, cond, "_shuffled", i, ".bed"))
+    shuf_gr  <- GRanges(
+      seqnames = shuf_raw$V1,
+      ranges   = IRanges(start = shuf_raw$V2, end = shuf_raw$V3),
+      strand   = shuf_raw$V6
+    )
+    extract_and_write_seqs(shuf_gr, paste0(cond, "shuf", i))
+  }
+}
+```
+
+---
+
+## 6  Differential binding — condition-exclusive and common peaks
+```{r differential-binding}
+#' Classify peaks in `query_ranges` relative to `subject_ranges`.
+#' Returns a list: $exclusive (GRanges), $common (GRanges)
+classify_peaks <- function(query_ranges, subject_ranges,
+                           fc_thresh = FC_EXCLUSIVE_THRESH) {
+
+  olap     <- findOverlaps(query_ranges, subject_ranges)
+  hit_idx  <- unique(queryHits(olap))
+
+  # For each query peak that overlaps a subject peak, compare mean_lfc
+  classification <- vapply(hit_idx, function(i) {
+    pos     <- which(queryHits(olap) == i)
+    q_score <- max(query_ranges[queryHits(olap[pos])]$mean_lfc)
+    s_score <- max(subject_ranges[subjectHits(olap[pos])]$mean_lfc)
+    if      (q_score > fc_thresh * s_score) "Increased"
+    else if (s_score > fc_thresh * q_score) "Decreased"
+    else                                     "Common"
+  }, character(1))
+
+  # Exclusive = no overlap at all + overlapping but strongly increased
+  no_overlap_idx <- setdiff(seq_along(query_ranges), hit_idx)
+  increased_idx  <- hit_idx[classification == "Increased"]
+  exclusive_idx  <- sort(c(no_overlap_idx, increased_idx))
+
+  common_idx <- hit_idx[classification == "Common"]
+
+  list(
+    exclusive = query_ranges[exclusive_idx],
+    common    = query_ranges[common_idx]
+  )
+}
+
+res_c1 <- classify_peaks(ranges_c1, ranges_c2)
+res_c2 <- classify_peaks(ranges_c2, ranges_c1)
+
+exclusive_c1 <- res_c1$exclusive
+exclusive_c2 <- res_c2$exclusive
+common_c1    <- res_c1$common
+common_c2    <- res_c2$common
+
+# Combine common peaks from both conditions into a single unprocessed BED
+# (will be sorted and merged by bedtools in the shell)
+all_common_df <- rbind(
+  cbind(
+    as.character(seqnames(common_c1)),
+    start(common_c1), end(common_c1),
+    common_c1$mean_enrichPval, common_c1$mean_lfc,
+    as.character(strand(common_c1))
+  ),
+  cbind(
+    as.character(seqnames(common_c2)),
+    start(common_c2), end(common_c2),
+    common_c2$mean_enrichPval, common_c2$mean_lfc,
+    as.character(strand(common_c2))
+  )
+)
+
+write.table(
+  all_common_df,
+  file      = paste0(peak_dir, "common_peaks.unprocessed.bed"),
+  sep       = "\t", quote = FALSE,
+  row.names = FALSE, col.names = FALSE
+)
+
+message("Written: common_peaks.unprocessed.bed")
+message("  → Run bedtools sort + merge in the shell before the next chunk.")
+```
+
+---
+
+## 7  Post-merge: load common peaks and extract sequences
+
+Run the bedtools sort/merge step in the shell first, then continue here.
+```{r common-peaks-post-merge}
+common_peaks_raw <- read.table(paste0(peak_dir, "common_peaks.merged.bed"))
+common_ranges    <- GRanges(
+  seqnames = common_peaks_raw$V1,
+  ranges   = IRanges(start = common_peaks_raw$V2, end = common_peaks_raw$V3),
+  strand   = common_peaks_raw$V6
+)
+
+extract_and_write_seqs(common_ranges,  "common_ranges")
+extract_and_write_seqs(exclusive_c1,   paste0(cond1, "_exclusive"))
+extract_and_write_seqs(exclusive_c2,   paste0(cond2, "_exclusive"))
+
+# Write exclusive peak BED files for downstream use
+export(exclusive_c1, paste0(peak_dir, cond1, "_exclusive.bed"), "bed")
+export(exclusive_c2, paste0(peak_dir, cond2, "_exclusive.bed"), "bed")
+```
+
+---
+
+## 8  Annotations of differential peak sets
+```{r annotations-differential}
+annot_excl_c1   <- annotatePeak(exclusive_c1,  TxDb = txdb, genomicAnnotationPriority = annot_priority)
+annot_excl_c2   <- annotatePeak(exclusive_c2,  TxDb = txdb, genomicAnnotationPriority = annot_priority)
+annot_common    <- annotatePeak(common_ranges,  TxDb = txdb, genomicAnnotationPriority = annot_priority)
+
+plotAnnoPie(annot_excl_c1);  annot_excl_c1
+plotAnnoPie(annot_excl_c2);  annot_excl_c2
+plotAnnoPie(annot_common);   annot_common
+```
+
+---
+
+## 9  Motif scoring (PWM z-score heatmaps)
+
+Run `count_pwm.R` on the cluster first to produce `pwm_colmeans_ext50.RData`.
+```{r motif-heatmaps}
+load(paste0(peak_dir, "pwm_colmeans_ext50.RData"))
+
+#' Scale a PWM means matrix and remove rows with NAs
+safe_scale <- function(mat) {
+  s <- t(scale(mat))
+  na_rows <- unique(which(is.na(s), arr.ind = TRUE)[, 1])
+  if (length(na_rows) > 0) s <- s[-na_rows, ]
+  s
+}
+
+s_c1      <- safe_scale(get(paste0("pwm_means_", cond1, "ext50")))
+s_c1_shuf <- safe_scale(get(paste0("pwm_means_", cond1, "ext50_shuff")))
+s_c1_rand <- safe_scale(get(paste0("pwm_means_", cond1, "ext50_rand")))
+
+s_c2      <- safe_scale(get(paste0("pwm_means_", cond2, "ext50")))
+s_c2_shuf <- safe_scale(get(paste0("pwm_means_", cond2, "ext50_shuff")))
+s_c2_rand <- safe_scale(get(paste0("pwm_means_", cond2, "ext50_rand")))
+
+# Restrict to motifs present in all three backgrounds
+common_motifs <- Reduce(intersect, list(
+  rownames(s_c1), rownames(s_c1_shuf), rownames(s_c1_rand)
+))
+s_c1      <- s_c1     [rownames(s_c1)      %in% common_motifs, ]
+s_c1_shuf <- s_c1_shuf[rownames(s_c1_shuf) %in% common_motifs, ]
+s_c1_rand <- s_c1_rand[rownames(s_c1_rand) %in% common_motifs, ]
+
+# Hierarchical clustering on condition 1 peaks to define motif order
+hc_c1 <- hclust(dist(s_c1))
+
+# Write ordered z-score tables and the motif tree
+write.tree(
+  as.phylo(hc_c1),
+  file = paste0(fig_dir, "tree_motifs.dnd")
+)
+write.table(s_c1     [hc_c1$order, ], paste0(fig_dir, "zsco_motifs_", cond1,        ".txt"), quote = FALSE, row.names = TRUE, col.names = FALSE)
+write.table(s_c1_shuf[hc_c1$order, ], paste0(fig_dir, "zsco_motifs_", cond1, "_shuff.txt"), quote = FALSE, row.names = TRUE, col.names = FALSE)
+write.table(s_c1_rand[hc_c1$order, ], paste0(fig_dir, "zsco_motifs_", cond1, "_rand.txt"),  quote = FALSE, row.names = TRUE, col.names = FALSE)
+
+# Helper to draw a diverging heatmap with a zero-centred colour scale
+plot_motif_heatmap <- function(mat, title = "") {
+  my_colors <- colorRampPalette(c("blue", "white", "red"))(100)
+  z_lim  <- max(abs(mat), na.rm = TRUE)
+  breaks <- c(seq(-z_lim, 0, length.out = 51),
+               seq(0,  z_lim, length.out = 51)[-1])
+  pheatmap(mat, main = title, cluster_cols = FALSE,
+           color = my_colors, breaks = breaks)
+}
+
+plot_motif_heatmap(s_c1,      paste(cond1, "peaks"))
+plot_motif_heatmap(s_c1_shuf, paste(cond1, "shuffled"))
+plot_motif_heatmap(s_c1_rand, paste(cond1, "random"))
+
+plot_motif_heatmap(s_c2,      paste(cond2, "peaks"))
+plot_motif_heatmap(s_c2_shuf, paste(cond2, "shuffled"))
+plot_motif_heatmap(s_c2_rand, paste(cond2, "random"))
+```
+
+---
+
+## 10  Overlap with the EwS splicing landscape
+```{r splicing-overlap}
+load(splicing_background_rdata)
+load(splicing_landscape_rdata)
+
+# Build GRanges spanning the full alternative-splicing event window for each
+# event type; stacks significant events and background events into single objects
+
+build_as_ranges <- function(se, ri, mxe, a5ss, a3ss) {
+  chr  <- c(se$chr, ri$chr, mxe$chr, a5ss$chr, a3ss$chr)
+  str  <- c(se$strand, ri$strand, mxe$strand, a5ss$strand, a3ss$strand)
+  # A5SS / A3SS: longer exon boundaries differ by strand
+  s1 <- c(
+    se$upstreamES,  ri$upstreamES,  mxe$upstreamES,
+    ifelse(a5ss$strand == "+", a5ss$longExonStart_0base, a5ss$flankingEE),
+    ifelse(a3ss$strand == "+", a3ss$flankingEE,          a3ss$longExonStart_0base)
+  )
+  e1 <- c(
+    se$downstreamEE,  ri$downstreamEE,  mxe$downstreamEE,
+    ifelse(a5ss$strand == "+", a5ss$flankingEE,          a5ss$longExonStart_0base),
+    ifelse(a3ss$strand == "+", a3ss$longExonStart_0base, a3ss$flankingEE)
+  )
+  as_type <- c(
+    rep("se",   nrow(se)),  rep("ri",   nrow(ri)),
+    rep("mxe",  nrow(mxe)), rep("a5ss", nrow(a5ss)),
+    rep("a3ss", nrow(a3ss))
+  )
+  GRanges(seqnames = chr, ranges = IRanges(start = s1, end = e1),
+          strand = str, as_type = as_type)
+}
+
+ranges_sig  <- build_as_ranges(land_se_dir, land_ri_dir, land_mxe_dir,
+                                land_a5ss_dir, land_a3ss_dir)
+ranges_back <- build_as_ranges(back_se,      back_ri,    back_mxe,
+                                back_a5ss,    back_a3ss)
+
+#' Fraction of AS events overlapping a peak set
+frac_as_overlap <- function(as_ranges, peak_ranges, ext = PEAK_EXT) {
+  o  <- findOverlaps(as_ranges, peak_ranges + ext)
+  tt <- table(queryHits(o))
+  v  <- integer(length(as_ranges))
+  v[as.integer(names(tt))] <- as.integer(tt)
+  mean(v > 0)
+}
+
+# Report overlap fractions for significant and background events
+for (label in c(cond1, cond2)) {
+  peaks <- switch(label, !!cond1 := exclusive_c1, !!cond2 := exclusive_c2)
+  message(label, " exclusive — sig overlap:  ", round(frac_as_overlap(unique(ranges_sig),  peaks) * 100, 1), "%")
+  message(label, " exclusive — back overlap: ", round(frac_as_overlap(unique(ranges_back), peaks) * 100, 1), "%")
+}
+message("Common peaks — sig overlap:  ", round(frac_as_overlap(unique(ranges_sig),  common_ranges) * 100, 1), "%")
+message("Common peaks — back overlap: ", round(frac_as_overlap(unique(ranges_back), common_ranges) * 100, 1), "%")
+
+# Skipped-exon subset separately (most biologically interpretable event type)
+ranges_se_sig  <- GRanges(seqnames = land_se_dir$chr,
+  ranges = IRanges(start = land_se_dir$upstreamES, end = land_se_dir$downstreamEE),
+  strand = land_se_dir$strand)
+ranges_se_back <- GRanges(seqnames = back_se$chr,
+  ranges = IRanges(start = back_se$upstreamES, end = back_se$downstreamEE),
+  strand = back_se$strand)
+
+message("SE events — ", cond1, " excl overlap (sig/back): ",
+  round(frac_as_overlap(ranges_se_sig,  exclusive_c1) * 100, 1), "% / ",
+  round(frac_as_overlap(ranges_se_back, exclusive_c1) * 100, 1), "%")
+message("SE events — ", cond2, " excl overlap (sig/back): ",
+  round(frac_as_overlap(ranges_se_sig,  exclusive_c2) * 100, 1), "% / ",
+  round(frac_as_overlap(ranges_se_back, exclusive_c2) * 100, 1), "%")
+```
+
+
+
