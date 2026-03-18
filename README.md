@@ -39,4 +39,5 @@ SLURM header.
 ## Contributors
 
 Loïc Ongena - loic.ongena@uliege.be
+
 Main contact: Franck Dequiedt - fdequiedt@uliege.be
